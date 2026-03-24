@@ -6,7 +6,6 @@
 
 int main(int argc, char* argv[])
 {
-    // Basic routing logic is provided.
     if (argc < 2)
         return 1;
 
@@ -34,16 +33,38 @@ int main(int argc, char* argv[])
 
 void mgit_init()
 {
-    // TODO: Safely initialize the repository structure.
-    // HINT: Check if ".mgit" already exists using stat(). If it does, do NOTHING
-    // to prevent accidental data destruction.
+    struct stat st;
+    /* If .mgit already exists, do nothing (idempotent) */
+    if (stat(".mgit", &st) == 0) {
+        return;
+    }
 
-    // TODO: Create the following directories with 0755 permissions:
-    // 1. ".mgit"
-    // 2. ".mgit/snapshots"
+    /* Create directories */
+    if (mkdir(".mgit", 0755) != 0) {
+        fprintf(stderr, "Error: Failed to create .mgit directory\n");
+        exit(1);
+    }
+    if (mkdir(".mgit/snapshots", 0755) != 0) {
+        fprintf(stderr, "Error: Failed to create .mgit/snapshots directory\n");
+        exit(1);
+    }
 
-    // TODO: Create the vault file ".mgit/data.bin".
-    // HINT: Open with O_CREAT | O_WRONLY and 0644 permissions. Do NOT use O_TRUNC!
+    /* Create vault file data.bin (O_CREAT without O_TRUNC) */
+    int fd = open(".mgit/data.bin", O_CREAT | O_WRONLY, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "Error: Failed to create data.bin\n");
+        exit(1);
+    }
+    close(fd);
 
-    // TODO: Create ".mgit/HEAD" and write "0" into it to initialize the snapshot counter.
+    /* Create HEAD file with "0" */
+    fd = open(".mgit/HEAD", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+    if (fd < 0) {
+        fprintf(stderr, "Error: Failed to create HEAD\n");
+        exit(1);
+    }
+    if (write(fd, "0", 1) < 0) {
+        fprintf(stderr, "Error: Failed to write HEAD\n");
+    }
+    close(fd);
 }

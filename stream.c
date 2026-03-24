@@ -1,15 +1,15 @@
 #include "mgit.h"
-#include <arpa/inet.h> // For htonl/ntohl
+#include <arpa/inet.h>
+#include <errno.h>
 
-// --- Safe I/O Helpers ---
-// These are essential for handling partial reads/writes in Pipes/Sockets.
+/* --- Safe I/O Helpers --- */
 ssize_t read_all(int fd, void* buf, size_t count)
 {
     size_t total = 0;
     while (total < count) {
         ssize_t ret = read(fd, (char*)buf + total, count - total);
         if (ret == 0)
-            break; // EOF
+            break; /* EOF */
         if (ret < 0) {
             if (errno == EINTR)
                 continue;
@@ -17,7 +17,7 @@ ssize_t read_all(int fd, void* buf, size_t count)
         }
         total += ret;
     }
-    return total;
+    return (ssize_t)total;
 }
 
 ssize_t write_all(int fd, const void* buf, size_t count)
@@ -32,10 +32,10 @@ ssize_t write_all(int fd, const void* buf, size_t count)
         }
         total += ret;
     }
-    return total;
+    return (ssize_t)total;
 }
 
-// --- Serialization Helper ---
+/* --- Serialization Helper --- */
 void* serialize_snapshot(Snapshot* snap, size_t* out_len)
 {
     size_t total_size = sizeof(uint32_t) * 2 + 256;
@@ -48,7 +48,9 @@ void* serialize_snapshot(Snapshot* snap, size_t* out_len)
     }
 
     void* buf = malloc(total_size);
-    void* ptr = buf;
+    if (!buf)
+        return NULL;
+    char* ptr = (char*)buf;
 
     memcpy(ptr, &snap->snapshot_id, sizeof(uint32_t));
     ptr += sizeof(uint32_t);
@@ -62,7 +64,7 @@ void* serialize_snapshot(Snapshot* snap, size_t* out_len)
         size_t fixed_size = sizeof(FileEntry) - sizeof(void*) * 2;
         memcpy(ptr, curr, fixed_size);
         ptr += fixed_size;
-        if (curr->num_blocks > 0) {
+        if (curr->num_blocks > 0 && curr->chunks) {
             size_t blocks_size = sizeof(BlockTable) * curr->num_blocks;
             memcpy(ptr, curr->chunks, blocks_size);
             ptr += blocks_size;
@@ -74,71 +76,267 @@ void* serialize_snapshot(Snapshot* snap, size_t* out_len)
     return buf;
 }
 
+/* Deserialize buffer into Snapshot */
+static Snapshot* deserialize_snapshot(void* buf, size_t len)
+{
+    (void)len;
+    Snapshot* snap = calloc(1, sizeof(Snapshot));
+    if (!snap)
+        return NULL;
+
+    char* ptr = (char*)buf;
+    memcpy(&snap->snapshot_id, ptr, sizeof(uint32_t));
+    ptr += sizeof(uint32_t);
+    memcpy(&snap->file_count, ptr, sizeof(uint32_t));
+    ptr += sizeof(uint32_t);
+    memcpy(snap->message, ptr, 256);
+    ptr += 256;
+
+    size_t fixed_size = sizeof(FileEntry) - sizeof(void*) * 2;
+    FileEntry *head = NULL, *tail = NULL;
+
+    for (uint32_t i = 0; i < snap->file_count; i++) {
+        FileEntry* fe = calloc(1, sizeof(FileEntry));
+        if (!fe)
+            break;
+
+        memcpy(fe, ptr, fixed_size);
+        ptr += fixed_size;
+        fe->chunks = NULL;
+        fe->next = NULL;
+
+        if (fe->num_blocks > 0) {
+            fe->chunks = malloc(sizeof(BlockTable) * fe->num_blocks);
+            memcpy(fe->chunks, ptr, sizeof(BlockTable) * fe->num_blocks);
+            ptr += sizeof(BlockTable) * fe->num_blocks;
+        }
+
+        if (!head) {
+            head = fe;
+            tail = fe;
+        } else {
+            tail->next = fe;
+            tail = fe;
+        }
+    }
+
+    snap->files = head;
+    return snap;
+}
+
 void mgit_send(const char* id_str)
 {
-    // 1. Handshake Phase
-    // TODO: Send the MAGIC_NUMBER (0x4D474954) to STDOUT.
+    Snapshot* snap = NULL;
+    int live_mode = 0;
+
+    if (id_str) {
+        uint32_t id = atoi(id_str);
+        snap = load_snapshot_from_disk(id);
+        if (!snap) {
+            fprintf(stderr, "Error: Snapshot not found.\n");
+            exit(1);
+        }
+    } else {
+        /* Live mode: build from current directory state */
+        uint32_t head_id = get_current_head();
+        snap = calloc(1, sizeof(Snapshot));
+        snap->snapshot_id = head_id > 0 ? head_id : 1;
+        snap->files = build_file_list_bfs(".", NULL);
+        live_mode = 1;
+
+        /* Count files */
+        uint32_t count = 0;
+        FileEntry* curr = snap->files;
+        while (curr) {
+            count++;
+            curr = curr->next;
+        }
+        snap->file_count = count;
+    }
+
+    /* 1. Handshake Phase: Send MAGIC_NUMBER */
     uint32_t magic = htonl(MAGIC_NUMBER);
     write_all(STDOUT_FILENO, &magic, 4);
-    // 2. Manifest Phase
-    // TODO: Serialize the snapshot metadata and send its size followed by the buffer.
+
+    /* 2. Manifest Phase: Serialize and send */
     size_t manifest_len;
     void* manifest_buf = serialize_snapshot(snap, &manifest_len);
-    // 3. Payload Phase
-    // TODO: Iterate through the files in the snapshot.
-    // - If DISK MODE: Read the compressed chunks from ".mgit/data.bin" and write_all to STDOUT.
-    // - If LIVE MODE: The chunks are already compressed in memory; send them directly.
-    uint32_t net_len = htonl(manifest_len);
+
+    uint32_t net_len = htonl((uint32_t)manifest_len);
     write_all(STDOUT_FILENO, &net_len, 4);
     write_all(STDOUT_FILENO, manifest_buf, manifest_len);
-    free();
+    free(manifest_buf);
+
+    /* 3. Payload Phase: Send file data chunks */
+    FileEntry* curr = snap->files;
+    while (curr) {
+        if (!curr->is_directory && curr->num_blocks > 0 && curr->chunks) {
+            for (int b = 0; b < curr->num_blocks; b++) {
+                uint32_t chunk_size = curr->chunks[b].compressed_size;
+                if (chunk_size > 0) {
+                    if (!live_mode) {
+                        /* DISK MODE: Read from data.bin */
+                        FILE* vault = fopen(".mgit/data.bin", "rb");
+                        if (vault) {
+                            fseek(vault, (long)curr->chunks[b].physical_offset, SEEK_SET);
+                            uint8_t buf[8192];
+                            uint32_t remaining = chunk_size;
+                            while (remaining > 0) {
+                                size_t to_read = remaining < sizeof(buf) ? remaining : sizeof(buf);
+                                size_t n = fread(buf, 1, to_read, vault);
+                                if (n == 0)
+                                    break;
+                                write_all(STDOUT_FILENO, buf, n);
+                                remaining -= (uint32_t)n;
+                            }
+                            fclose(vault);
+                        }
+                    } else {
+                        /* LIVE MODE: Read directly from the file */
+                        FILE* f = fopen(curr->path, "rb");
+                        if (f) {
+                            uint8_t buf[8192];
+                            size_t n;
+                            while ((n = fread(buf, 1, sizeof(buf), f)) > 0) {
+                                write_all(STDOUT_FILENO, buf, n);
+                            }
+                            fclose(f);
+                        }
+                    }
+                }
+            }
+        }
+        curr = curr->next;
+    }
+
+    free_file_list(snap->files);
+    free(snap);
 }
 
 void mgit_receive(const char* dest_path)
 {
-    // 1. Setup
-    // TODO: mkdir(dest_path) and mgit_init() inside it.
+    /* 1. Setup: Create destination and init */
+    struct stat st;
+    if (stat(dest_path, &st) != 0) {
+        mkdir(dest_path, 0755);
+    }
 
-    uint32_t magic;
-    if (read_all(STDIN_FILENO, &magic, 4) != 4)
+    /* Save current directory and chdir to dest */
+    char orig_dir[4096];
+    if (!getcwd(orig_dir, sizeof(orig_dir))) {
+        fprintf(stderr, "Error: getcwd failed\n");
         exit(1);
+    }
+    if (chdir(dest_path) != 0) {
+        fprintf(stderr, "Error: Cannot chdir to %s\n", dest_path);
+        exit(1);
+    }
+
+    /* Init if needed */
+    mgit_init();
+
+    /* 2. Handshake Phase: Read and verify MAGIC_NUMBER */
+    uint32_t magic;
+    if (read_all(STDIN_FILENO, &magic, 4) != 4) {
+        fprintf(stderr, "Error: Failed to read handshake\n");
+        exit(1);
+    }
     if (ntohl(magic) != MAGIC_NUMBER) {
         fprintf(stderr, "Error: Invalid protocol\n");
         exit(1);
     }
 
-    // 2. Handshake Phase
-    // TODO: read_all from STDIN and verify the MAGIC_NUMBER.
-
+    /* 3. Manifest Reconstruction */
     uint32_t net_len;
-    if (read_all(STDIN_FILENO, &net_len, 4) != 4)
+    if (read_all(STDIN_FILENO, &net_len, 4) != 4) {
+        fprintf(stderr, "Error: Failed to read manifest size\n");
         exit(1);
+    }
     size_t manifest_len = ntohl(net_len);
 
-    // 3. Manifest Reconstruction
-    // TODO: Read the manifest size, allocate memory, and read the serialized data.
-    // Reconstruct the linked list of FileEntries.
+    void* buf = malloc(manifest_len);
+    if (!buf) {
+        fprintf(stderr, "Error: malloc failed\n");
+        exit(1);
+    }
+    if (read_all(STDIN_FILENO, buf, manifest_len) != (ssize_t)manifest_len) {
+        fprintf(stderr, "Error: Failed to read manifest\n");
+        free(buf);
+        exit(1);
+    }
 
-    // 4. Processing Chunks (The Streaming OS Challenge)
-    // TODO: Open ".mgit/data.bin" for appending.
-    // For each file in the manifest:
-    //   1. Open the file in the workspace for writing ("wb").
-    //   2. While reading the compressed chunk from STDIN:
-    //      - Write the raw compressed bytes into the local ".mgit/data.bin".
-    //      - HINT: Don't forget to update physical_offset for the local vault!
+    Snapshot* snap = deserialize_snapshot(buf, manifest_len);
+    free(buf);
+    if (!snap) {
+        fprintf(stderr, "Error: Failed to deserialize manifest\n");
+        exit(1);
+    }
 
-    // 5. Cleanup
-    // TODO: Save the new snapshot to disk and update HEAD.
+    /* 4. Processing Chunks: Read data from stdin and append to local data.bin */
+    FILE* vault = fopen(".mgit/data.bin", "ab");
+    if (!vault) {
+        fprintf(stderr, "Error: Cannot open data.bin for appending\n");
+        exit(1);
+    }
+
+    FileEntry* curr = snap->files;
+    while (curr) {
+        if (!curr->is_directory && curr->num_blocks > 0 && curr->chunks) {
+            for (int b = 0; b < curr->num_blocks; b++) {
+                uint32_t chunk_size = curr->chunks[b].compressed_size;
+
+                /* Record where we're appending in the local vault */
+                fseek(vault, 0, SEEK_END);
+                uint64_t local_offset = (uint64_t)ftell(vault);
+
+                if (chunk_size > 0) {
+                    /* Read chunk data from stdin and write to local vault */
+                    uint8_t iobuf[8192];
+                    uint32_t remaining = chunk_size;
+                    while (remaining > 0) {
+                        size_t to_read = remaining < sizeof(iobuf) ? remaining : sizeof(iobuf);
+                        ssize_t n = read_all(STDIN_FILENO, iobuf, to_read);
+                        if (n <= 0)
+                            break;
+                        fwrite(iobuf, 1, (size_t)n, vault);
+                        remaining -= (uint32_t)n;
+                    }
+                }
+
+                /* Update physical_offset to local vault location */
+                curr->chunks[b].physical_offset = local_offset;
+            }
+        }
+        curr = curr->next;
+    }
+
+    fclose(vault);
+
+    /* 5. Save the new snapshot to disk and update HEAD */
+    uint32_t local_head = get_current_head();
+    uint32_t new_id = local_head + 1;
+    snap->snapshot_id = new_id;
+
+    store_snapshot_to_disk(snap);
+    update_head(new_id);
+
+    free_file_list(snap->files);
+    free(snap);
+
+    /* Return to original directory */
+    if (chdir(orig_dir) != 0) {
+        fprintf(stderr, "Error: Cannot chdir back\n");
+    }
 }
 
 void mgit_show(const char* id_str)
 {
     Snapshot* snap = NULL;
 
-    // Logic for loading a specific snapshot vs. a live view
     if (id_str) {
-        /* 1. Convert id_str to an integer and load the snapshot */
-        snap = ____________________________________________;
+        /* Load a specific snapshot */
+        uint32_t id = atoi(id_str);
+        snap = load_snapshot_from_disk(id);
 
         if (!snap) {
             fprintf(stderr, "Error: Snapshot not found.\n");
@@ -146,25 +344,20 @@ void mgit_show(const char* id_str)
         }
         printf("SNAPSHOT %d: %s\n", snap->snapshot_id, snap->message);
     } else {
-        /* 2. Initialize a new snapshot structure for the live view */
-        snap = ____________________________________________;
-
-        /* 3. Populate the file list using a BFS traversal starting at "." */
-        snap->files = _____________________________________;
-
+        /* Live view: build from current directory */
+        snap = calloc(1, sizeof(Snapshot));
+        snap->files = build_file_list_bfs(".", NULL);
         printf("LIVE VIEW\n");
     }
 
-    /* 4. Traverse and print the file list */
-    FileEntry* c = ____________;
-    while (____) {
+    /* Traverse and print the file list */
+    FileEntry* c = snap->files;
+    while (c) {
         printf("%s %s\n", c->is_directory ? "DIR " : "FILE", c->path);
-
-        /* 5. Move to the next entry */
-        c = ____________;
+        c = c->next;
     }
 
-    /* 6. Clean up resources to prevent memory leaks */
-    ____________________________________;
-    ____________________________________;
+    /* Clean up */
+    free_file_list(snap->files);
+    free(snap);
 }
